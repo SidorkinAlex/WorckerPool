@@ -2,24 +2,40 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 )
 
 const (
-	pipePath          = "/tmp/command_pipe" // Путь к именованному каналу
-	maxTotalWorkers   = 50                  // Максимальное общее количество воркеров
-	highPriorityMin   = 40                  // Минимальное количество воркеров для очереди высокого приоритета
-	mediumPriorityMin = 7                   // Минимальное количество воркеров для очереди среднего приоритета
-	lowPriorityMin    = 3                   // Минимальное количество воркеров для очереди низкого приоритета
-	mediumPriorityMax = 10                  // Максимальное количество воркеров для очереди среднего приоритета
-	lowPriorityMax    = 5                   // Максимальное количество воркеров для очереди низкого приоритета
+	pipePath = "/tmp/command_pipe" // Путь к именованному каналу
 )
+
+// Значения по умолчанию
+var (
+	maxTotalWorkers   = 50
+	highPriorityMin   = 40
+	mediumPriorityMin = 7
+	lowPriorityMin    = 3
+	mediumPriorityMax = 10
+	lowPriorityMax    = 5
+)
+
+// Структура для конфигурации
+type Config struct {
+	MaxTotalWorkers   int `json:"max_total_workers"`
+	HighPriorityMin   int `json:"high_priority_min"`
+	MediumPriorityMin int `json:"medium_priority_min"`
+	LowPriorityMin    int `json:"low_priority_min"`
+	MediumPriorityMax int `json:"medium_priority_max"`
+	LowPriorityMax    int `json:"low_priority_max"`
+}
 
 var (
 	startFlag   = flag.Bool("start", false, "Start the program")
@@ -120,35 +136,71 @@ func startPipeListener(queues map[string]*CommandQueue) {
 	}
 }
 
-func manageWorkers(queues map[string]*CommandQueue, wg *sync.WaitGroup, sem chan struct{}) {
-	// Управление воркерами для каждой очереди
-	highWorkers := highPriorityMin
-	mediumWorkers := mediumPriorityMin
-	lowWorkers := lowPriorityMin
+func loadConfig() {
+	// Проверяем переменные окружения
+	if val, ok := os.LookupEnv("MAX_TOTAL_WORKERS"); ok {
+		if v, err := strconv.Atoi(val); err == nil {
+			maxTotalWorkers = v
+		}
+	}
+	if val, ok := os.LookupEnv("HIGH_PRIORITY_MIN"); ok {
+		if v, err := strconv.Atoi(val); err == nil {
+			highPriorityMin = v
+		}
+	}
+	if val, ok := os.LookupEnv("MEDIUM_PRIORITY_MIN"); ok {
+		if v, err := strconv.Atoi(val); err == nil {
+			mediumPriorityMin = v
+		}
+	}
+	if val, ok := os.LookupEnv("LOW_PRIORITY_MIN"); ok {
+		if v, err := strconv.Atoi(val); err == nil {
+			lowPriorityMin = v
+		}
+	}
+	if val, ok := os.LookupEnv("MEDIUM_PRIORITY_MAX"); ok {
+		if v, err := strconv.Atoi(val); err == nil {
+			mediumPriorityMax = v
+		}
+	}
+	if val, ok := os.LookupEnv("LOW_PRIORITY_MAX"); ok {
+		if v, err := strconv.Atoi(val); err == nil {
+			lowPriorityMax = v
+		}
+	}
 
-	for {
-		// Проверяем, есть ли задачи в очередях
-		if len(queues["high"].queue) > 0 && highWorkers < maxTotalWorkers {
-			highWorkers++
-			wg.Add(1)
-			go worker(highWorkers, queues["high"], wg, sem)
-		} else if len(queues["medium"].queue) > 0 && mediumWorkers < mediumPriorityMax {
-			mediumWorkers++
-			wg.Add(1)
-			go worker(mediumWorkers, queues["medium"], wg, sem)
-		} else if len(queues["low"].queue) > 0 && lowWorkers < lowPriorityMax {
-			lowWorkers++
-			wg.Add(1)
-			go worker(lowWorkers, queues["low"], wg, sem)
+	// Если переменные окружения не заданы, читаем из файла конфигурации
+	configFile := "config.json"
+	if _, err := os.Stat(configFile); err == nil {
+		file, err := os.Open(configFile)
+		if err != nil {
+			fmt.Printf("Error opening config file: %s\n", err)
+			return
+		}
+		defer file.Close()
+
+		decoder := json.NewDecoder(file)
+		config := Config{}
+		if err := decoder.Decode(&config); err != nil {
+			fmt.Printf("Error decoding config file: %s\n", err)
+			return
 		}
 
-		// Пауза перед следующей проверкой
-		time.Sleep(500 * time.Millisecond)
+		// Применяем значения из конфигурации
+		maxTotalWorkers = config.MaxTotalWorkers
+		highPriorityMin = config.HighPriorityMin
+		mediumPriorityMin = config.MediumPriorityMin
+		lowPriorityMin = config.LowPriorityMin
+		mediumPriorityMax = config.MediumPriorityMax
+		lowPriorityMax = config.LowPriorityMax
 	}
 }
 
 func main() {
 	flag.Parse()
+
+	// Загружаем конфигурацию
+	loadConfig()
 
 	if *startFlag {
 		fmt.Println("Program started...")
@@ -179,9 +231,6 @@ func main() {
 
 		// Запуск слушателя именованного канала
 		go startPipeListener(queues)
-
-		// Управление воркерами
-		go manageWorkers(queues, &wg, sem)
 
 		// Ожидание завершения всех воркеров
 		wg.Wait()
