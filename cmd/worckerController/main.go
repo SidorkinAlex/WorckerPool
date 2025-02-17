@@ -1,10 +1,9 @@
 package main
 
 import (
-	"container/list"
+	"bufio"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"sync"
@@ -12,143 +11,139 @@ import (
 	"time"
 )
 
-const maxConcurrentCommands = 30
+const (
+	pipePath              = "/tmp/command_pipe" // Путь к именованному каналу
+	maxConcurrentCommands = 30                  // Максимальное количество одновременно выполняемых команд
+)
+
+var (
+	startFlag   = flag.Bool("start", false, "Start the program")
+	commandFlag = flag.String("command", "", "Command to execute")
+)
 
 type CommandQueue struct {
-	queue *list.List
+	queue []string
 	mu    sync.Mutex
-}
-
-func NewCommandQueue() *CommandQueue {
-	return &CommandQueue{
-		queue: list.New(),
-	}
 }
 
 func (cq *CommandQueue) Add(command string) {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
-	cq.queue.PushBack(command)
+	cq.queue = append(cq.queue, command)
 }
 
-func (cq *CommandQueue) Get() string {
+func (cq *CommandQueue) Get() (string, bool) {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
-	if cq.queue.Len() == 0 {
-		return ""
+	if len(cq.queue) == 0 {
+		return "", false
 	}
-	element := cq.queue.Front()
-	cq.queue.Remove(element)
-	return element.Value.(string)
+	cmd := cq.queue[0]
+	cq.queue = cq.queue[1:]
+	return cmd, true
 }
 
-func (cq *CommandQueue) IsEmpty() bool {
-	cq.mu.Lock()
-	defer cq.mu.Unlock()
-	return cq.queue.Len() == 0
-}
-
-func worker(queue *CommandQueue, wg *sync.WaitGroup, stopChan <-chan struct{}) {
+func worker(id int, cq *CommandQueue, wg *sync.WaitGroup, sem chan struct{}) {
 	defer wg.Done()
 	for {
-		select {
-		case <-stopChan:
-			log.Println("Worker stopping...")
-			return
-		default:
-			command := queue.Get()
-			if command == "" {
-				time.Sleep(100 * time.Millisecond) // Ждем, если очередь пуста
-				continue
-			}
+		command, ok := cq.Get()
+		if !ok {
+			time.Sleep(100 * time.Millisecond) // Если очередь пуста, ждем 0.1 секунды
+			continue
+		}
 
-			log.Printf("Executing command: %s", command)
-			cmd := exec.Command("bash", "-c", command)
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				log.Printf("Error executing command: %s, Error: %v", command, err)
-			} else {
-				log.Printf("Command output: %s", string(output))
+		// Занимаем слот в семафоре
+		sem <- struct{}{}
+
+		fmt.Printf("Worker %d executing: %s\n", id, command)
+		cmd := exec.Command("bash", "-c", command)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("Worker %d error: %s\n", id, err)
+		} else {
+			fmt.Printf("Worker %d output: %s\n", id, string(output))
+		}
+
+		// Освобождаем слот в семафоре
+		<-sem
+	}
+}
+
+func startPipeListener(cq *CommandQueue) {
+	// Удаляем старый канал, если он существует
+	if _, err := os.Stat(pipePath); err == nil {
+		os.Remove(pipePath)
+	}
+
+	// Создаем именованный канал
+	err := syscall.Mkfifo(pipePath, 0666)
+	if err != nil {
+		fmt.Printf("Error creating named pipe: %s\n", err)
+		return
+	}
+	defer os.Remove(pipePath)
+
+	fmt.Printf("Listening for commands on pipe: %s\n", pipePath)
+
+	for {
+		// Открываем канал для чтения
+		pipe, err := os.OpenFile(pipePath, os.O_RDONLY, os.ModeNamedPipe)
+		if err != nil {
+			fmt.Printf("Error opening pipe: %s\n", err)
+			continue
+		}
+
+		// Читаем команды из канала
+		scanner := bufio.NewScanner(pipe)
+		for scanner.Scan() {
+			command := scanner.Text()
+			if command != "" {
+				cq.Add(command)
+				fmt.Printf("Command added to queue: %s\n", command)
 			}
 		}
+
+		pipe.Close()
 	}
 }
 
 func main() {
-	// Обработка флагов
-	stopFlag := flag.Bool("stop", false, "Stop the daemon")
-	commandFlag := flag.String("command", "", "Command to execute")
 	flag.Parse()
 
-	// PID-файл для управления демоном
-	pidFile := "/tmp/go_daemon.pid"
+	if *startFlag {
+		fmt.Println("Program started...")
+		commandQueue := &CommandQueue{}
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, maxConcurrentCommands)
 
-	if *stopFlag {
-		// Остановка демона
-		data, err := os.ReadFile(pidFile)
+		// Запуск воркеров
+		for i := 0; i < maxConcurrentCommands; i++ {
+			wg.Add(1)
+			go worker(i, commandQueue, &wg, sem)
+		}
+
+		// Запуск слушателя именованного канала
+		go startPipeListener(commandQueue)
+
+		// Ожидание завершения всех воркеров
+		wg.Wait()
+	} else if *commandFlag != "" {
+		// Отправка команды в именованный канал
+		pipe, err := os.OpenFile(pipePath, os.O_WRONLY|os.O_APPEND, os.ModeNamedPipe)
 		if err != nil {
-			log.Fatalf("Failed to read PID file: %v", err)
+			fmt.Printf("Error opening pipe: %s\n", err)
+			return
 		}
-		var pid int
-		fmt.Sscanf(string(data), "%d", &pid)
-		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
-			log.Fatalf("Failed to stop daemon: %v", err)
-		}
-		log.Println("Daemon stopped")
-		os.Remove(pidFile)
-		return
-	}
+		defer pipe.Close()
 
-	if *commandFlag != "" {
-		// Добавление команды в очередь через файл PID
-		data, err := os.ReadFile(pidFile)
+		_, err = pipe.WriteString(*commandFlag + "\n")
 		if err != nil {
-			log.Fatalf("Failed to read PID file: %v", err)
+			fmt.Printf("Error writing to pipe: %s\n", err)
+			return
 		}
-		var pid int
-		fmt.Sscanf(string(data), "%d", &pid)
-		if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil {
-			log.Fatalf("Failed to send command to daemon: %v", err)
-		}
-		log.Printf("Command sent to daemon: %s", *commandFlag)
-		return
-	}
 
-	log.Println("Daemon started")
-
-	// Создаем очередь команд
-	queue := NewCommandQueue()
-
-	// Канал для остановки воркеров
-	stopChan := make(chan struct{})
-	var wg sync.WaitGroup
-
-	// Запускаем воркеры
-	for i := 0; i < maxConcurrentCommands; i++ {
-		wg.Add(1)
-		go worker(queue, &wg, stopChan)
-	}
-
-	// Обработка сигналов для добавления команд
-	go func() {
-		for {
-			var command string
-			log.Println("Waiting for command input...")
-			_, err := fmt.Scanln(&command)
-			if err != nil {
-				log.Printf("Error reading input: %v", err)
-				continue
-			}
-
-			log.Printf("Adding command to queue: %s", command)
-			queue.Add(command)
-		}
-	}()
-
-	// Основной процесс
-	for {
-		if queue.IsEmpty() {
-			time.Sleep(1000 * time.Millisecond) // Спим, если очередь пуста
-		}
+		fmt.Printf("Command sent to queue: %s\n", *commandFlag)
+	} else {
+		fmt.Println("Use -start flag to start the program or -command to add a command.")
 	}
 }
